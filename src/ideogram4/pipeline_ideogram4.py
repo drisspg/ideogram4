@@ -152,25 +152,41 @@ def _load_qwen3_vl(
   return tokenizer, model
 
 
+def build_meta_transformer(
+  transformer_config: "Ideogram4Config",
+) -> "Ideogram4Transformer":
+  """Construct on meta to avoid initializing full-size weights before assign-loading checkpoints."""
+  with torch.device("meta"):
+    model = Ideogram4Transformer(transformer_config)
+  head_dim = transformer_config.emb_dim // transformer_config.num_heads
+  inv_freq = 1.0 / (
+    transformer_config.rope_theta
+    ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+  )
+  model.rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
+  return model
+
+
 def _build_transformer(
   transformer_config: "Ideogram4Config",
   state_dict: dict[str, torch.Tensor],
   device: torch.device,
   dtype: torch.dtype,
 ) -> "Ideogram4Transformer":
-  model = Ideogram4Transformer(transformer_config)
   if is_bnb4bit_state_dict(state_dict):
     if device.type != "cuda":
       raise ValueError(f"bnb 4-bit weights require a CUDA device, got device={device}")
-    swap_linears_to_bnb4bit(model, compute_dtype=dtype)
-    load_bnb4bit_state_dict(model, state_dict, device=device, dtype=dtype)
+    model = build_meta_transformer(transformer_config)
+    with torch.device("meta"):
+      swap_linears_to_bnb4bit(model, compute_dtype=dtype)
+    load_bnb4bit_state_dict(model, state_dict, device=device, dtype=dtype, assign=True)
   elif is_fp8_state_dict(state_dict):
-    # Weight-only FP8: cast the unquantized params to the compute dtype first,
-    # then swap in Fp8Linear layers (which keep their weights as float8).
-    model.to(dtype)
-    swap_linears_to_fp8(model, state_dict, compute_dtype=dtype)
-    load_fp8_state_dict(model, state_dict, device=device, dtype=dtype)
+    model = build_meta_transformer(transformer_config)
+    with torch.device("meta"):
+      swap_linears_to_fp8(model, state_dict, compute_dtype=dtype)
+    load_fp8_state_dict(model, state_dict, device=device, dtype=dtype, assign=True)
   else:
+    model = Ideogram4Transformer(transformer_config)
     model.load_state_dict(state_dict)
     model.to(device=device, dtype=dtype)
   model.eval()

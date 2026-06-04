@@ -62,6 +62,8 @@ def load_bnb4bit_state_dict(
   state_dict: dict[str, torch.Tensor],
   device: torch.device,
   dtype: torch.dtype,
+  *,
+  assign: bool = False,
 ) -> None:
   consumed: set[str] = set()
   for full_name, tensor in state_dict.items():
@@ -92,7 +94,7 @@ def load_bnb4bit_state_dict(
     else:
       remaining[k] = remaining[k].to(device=device)
 
-  missing, unexpected = model.load_state_dict(remaining, strict=False)
+  missing, unexpected = model.load_state_dict(remaining, strict=False, assign=assign)
   # Quantized weights are loaded via from_prequantized above, so they appear in
   # `missing` from load_state_dict's perspective — filter those out.
   real_missing = [m for m in missing if m not in consumed]
