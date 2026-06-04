@@ -45,6 +45,11 @@ from ideogram4.scheduler import (
 )
 
 
+def _load_safetensors_state_dict(path: str) -> dict[str, torch.Tensor]:
+  """Clone to cpu immediately causing tensors to break mmaping and speedup loading."""
+  return {name: tensor.clone() for name, tensor in load_file(path).items()}
+
+
 def _load_subfolder_state_dict(
   repo_id: str, subfolder: str, basename: str
 ) -> dict[str, torch.Tensor]:
@@ -61,7 +66,69 @@ def _load_subfolder_state_dict(
     single_path = hf_hub_download(
       repo_id=repo_id, filename=f"{prefix}{basename}.safetensors"
     )
-    return load_file(single_path)
+    return _load_safetensors_state_dict(single_path)
+
+
+def _materialize_qwen3_vl_meta_init_buffers(model) -> None:
+  """Materialize small fp32 rotary buffers skipped by meta construction."""
+  text_rotary = model.language_model.rotary_emb
+  inv_freq, text_rotary.attention_scaling = text_rotary.compute_default_rope_parameters(
+    text_rotary.config, torch.device("cpu")
+  )
+  text_rotary.register_buffer("inv_freq", inv_freq, persistent=False)
+  text_rotary.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
+
+  vision_rotary = model.visual.rotary_pos_emb
+  vision_inv_freq = 1.0 / (
+    vision_rotary.theta
+    ** (torch.arange(0, vision_rotary.dim, 2, dtype=torch.float32) / vision_rotary.dim)
+  )
+  vision_rotary.register_buffer("inv_freq", vision_inv_freq, persistent=False)
+
+
+def _bnb4bit_quantization_config(
+  quantization_config: object,
+) -> dict[str, object] | None:
+  """Return supported bnb 4-bit configs and reject other quantization formats."""
+  if not isinstance(quantization_config, dict):
+    return None
+  if quantization_config.get("quant_method") != "bitsandbytes":
+    return None
+  if not (
+    quantization_config.get("load_in_4bit") or quantization_config.get("_load_in_4bit")
+  ):
+    return None
+  return dict(quantization_config)
+
+
+def _load_bnb4bit_text_encoder(
+  repo_id: str,
+  device: torch.device,
+  dtype: torch.dtype,
+  *,
+  text_encoder_subfolder: str,
+  quantization_config: dict[str, object],
+) -> torch.nn.Module:
+  """Load bnb 4-bit Qwen on meta to avoid Transformers' slow bnb placement path."""
+  config = AutoConfig.from_pretrained(
+    repo_id, subfolder=text_encoder_subfolder, trust_remote_code=True
+  )
+  state_dict = _load_subfolder_state_dict(repo_id, text_encoder_subfolder, "model")
+  with torch.device("meta"):
+    model = AutoModel.from_config(config, trust_remote_code=True)
+  _materialize_qwen3_vl_meta_init_buffers(model)
+  with torch.device("meta"):
+    swap_linears_to_bnb4bit(
+      model,
+      compute_dtype=dtype,
+      quant_type=str(quantization_config.get("bnb_4bit_quant_type", "nf4")),
+      compress_statistics=bool(
+        quantization_config.get("bnb_4bit_use_double_quant", False)
+      ),
+    )
+  load_bnb4bit_state_dict(model, state_dict, device=device, dtype=dtype)
+  model.eval()
+  return model
 
 
 def _load_fp8_text_encoder(
@@ -81,9 +148,12 @@ def _load_fp8_text_encoder(
   config = AutoConfig.from_pretrained(
     repo_id, subfolder=text_encoder_subfolder, trust_remote_code=True
   )
-  model = AutoModel.from_config(config, trust_remote_code=True)
   state_dict = _load_subfolder_state_dict(repo_id, text_encoder_subfolder, "model")
-  swap_linears_to_fp8(model, state_dict, compute_dtype=dtype)
+  with torch.device("meta"):
+    model = AutoModel.from_config(config, trust_remote_code=True)
+  _materialize_qwen3_vl_meta_init_buffers(model)
+  with torch.device("meta"):
+    swap_linears_to_fp8(model, state_dict, compute_dtype=dtype)
   # assign=True so unquantized params take the loaded dtype and the computed
   # rotary buffers (absent from the checkpoint) survive; tied weights, if any,
   # surface as benign missing keys.
@@ -107,10 +177,6 @@ def _load_qwen3_vl(
   When the weights are published in diffusers layout the tokenizer lives at ``tokenizer/``
   and the model at ``text_encoder/`` within the same repo as the transformer weights, so
   there is no need to fetch them from a separate upstream repo.
-
-  If the saved ``text_encoder/config.json`` carries a ``quantization_config`` (e.g.
-  a bitsandbytes 4-bit checkpoint), transformers handles the bnb placement via
-  ``device_map`` and we skip the explicit ``.to(device)`` move afterwards.
   """
   tokenizer_kwargs = {"subfolder": tokenizer_subfolder} if tokenizer_subfolder else {}
   model_kwargs = {"subfolder": text_encoder_subfolder} if text_encoder_subfolder else {}
@@ -124,7 +190,8 @@ def _load_qwen3_vl(
   )
   with open(cfg_path) as f:
     cfg_data = json.load(f)
-  is_quantized = "quantization_config" in cfg_data
+  quantization_config = cfg_data.get("quantization_config")
+  bnb4bit_config = _bnb4bit_quantization_config(quantization_config)
   is_fp8 = bool(cfg_data.get(FP8_TEXT_ENCODER_CONFIG_FLAG, False))
 
   if is_fp8:
@@ -134,7 +201,15 @@ def _load_qwen3_vl(
       dtype,
       text_encoder_subfolder=text_encoder_subfolder or "",
     )
-  elif is_quantized:
+  elif bnb4bit_config is not None:
+    model = _load_bnb4bit_text_encoder(
+      repo_id,
+      device,
+      dtype,
+      text_encoder_subfolder=text_encoder_subfolder or "",
+      quantization_config=bnb4bit_config,
+    )
+  elif quantization_config is not None:
     model = AutoModel.from_pretrained(
       repo_id,
       torch_dtype=dtype,
@@ -179,7 +254,7 @@ def _build_transformer(
     model = build_meta_transformer(transformer_config)
     with torch.device("meta"):
       swap_linears_to_bnb4bit(model, compute_dtype=dtype)
-    load_bnb4bit_state_dict(model, state_dict, device=device, dtype=dtype, assign=True)
+    load_bnb4bit_state_dict(model, state_dict, device=device, dtype=dtype)
   elif is_fp8_state_dict(state_dict):
     model = build_meta_transformer(transformer_config)
     with torch.device("meta"):
@@ -195,8 +270,9 @@ def _build_transformer(
 
 def _load_autoencoder(weights_path: str, device: torch.device, dtype: torch.dtype):
   ae = AutoEncoder(AutoEncoderParams())
-  state_dict = convert_diffusers_state_dict(load_file(weights_path))
-  ae.load_state_dict(state_dict)
+  ae.load_state_dict(
+    convert_diffusers_state_dict(_load_safetensors_state_dict(weights_path))
+  )
   ae.to(device=device, dtype=dtype)
   ae.eval()
   return ae
@@ -223,7 +299,7 @@ def _load_sharded_state_dict(
   for shard in shard_filenames:
     shard_repo_path = _posix_join(shard_dir, shard) if shard_dir else shard
     shard_path = hf_hub_download(repo_id=repo_id, filename=shard_repo_path)
-    state_dict.update(load_file(shard_path))
+    state_dict.update(_load_safetensors_state_dict(shard_path))
   return state_dict
 
 
@@ -242,7 +318,7 @@ def _load_indexed_or_single_state_dict(
   except EntryNotFoundError:
     single_filename = index_filename.removesuffix(".index.json")
     single_path = hf_hub_download(repo_id=repo_id, filename=single_filename)
-    return load_file(single_path)
+    return _load_safetensors_state_dict(single_path)
 
 
 @dataclass

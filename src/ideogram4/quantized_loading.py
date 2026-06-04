@@ -62,9 +62,8 @@ def load_bnb4bit_state_dict(
   state_dict: dict[str, torch.Tensor],
   device: torch.device,
   dtype: torch.dtype,
-  *,
-  assign: bool = False,
 ) -> None:
+  """Load a bnb 4-bit checkpoint by assigning prepared tensors into the model."""
   consumed: set[str] = set()
   for full_name, tensor in state_dict.items():
     if ".quant_state." in full_name or full_name.endswith(_BNB_SIBLING_SUFFIXES):
@@ -75,9 +74,10 @@ def load_bnb4bit_state_dict(
     if not isinstance(current, bnb.nn.Params4bit):
       continue
     prefix = full_name + "."
-    quantized_stats = {k: v for k, v in state_dict.items() if k.startswith(prefix)}
-    # bnb's from_prequantized pops keys it consumes from the dict, so snapshot
-    # the names first.
+    quantized_stats = {
+      name: stat for name, stat in state_dict.items() if name.startswith(prefix)
+    }
+    # bnb's from_prequantized may mutate the stats dict, so snapshot names first.
     consumed.add(full_name)
     consumed.update(quantized_stats.keys())
     parent._parameters[param_name] = bnb.nn.Params4bit.from_prequantized(
@@ -87,14 +87,18 @@ def load_bnb4bit_state_dict(
       device=device,
     )
 
-  remaining = {k: v for k, v in state_dict.items() if k not in consumed}
-  for k in list(remaining):
-    if remaining[k].is_floating_point():
-      remaining[k] = remaining[k].to(device=device, dtype=dtype)
+  prepared_remaining = {}
+  for name, tensor in state_dict.items():
+    if name in consumed:
+      continue
+    if tensor.is_floating_point():
+      prepared_remaining[name] = tensor.to(device=device, dtype=dtype)
     else:
-      remaining[k] = remaining[k].to(device=device)
+      prepared_remaining[name] = tensor.to(device=device)
 
-  missing, unexpected = model.load_state_dict(remaining, strict=False, assign=assign)
+  missing, unexpected = model.load_state_dict(
+    prepared_remaining, strict=False, assign=True
+  )
   # Quantized weights are loaded via from_prequantized above, so they appear in
   # `missing` from load_state_dict's perspective — filter those out.
   real_missing = [m for m in missing if m not in consumed]
@@ -103,30 +107,16 @@ def load_bnb4bit_state_dict(
   if unexpected:
     raise RuntimeError(f"unexpected keys after quantized load: {unexpected[:10]}")
 
-  for p in model.parameters():
-    if isinstance(p, bnb.nn.Params4bit):
-      continue
-    if p.is_floating_point() and p.dtype != dtype:
-      p.data = p.data.to(dtype=dtype)
-    if p.device != device:
-      p.data = p.data.to(device=device)
-  for name, b in list(model.named_buffers()):
-    if b.is_floating_point() and b.dtype != dtype:
-      parent_path, _, leaf = name.rpartition(".")
-      parent = model.get_submodule(parent_path) if parent_path else model
-      parent.register_buffer(
-        leaf,
-        b.to(device=device, dtype=dtype),
-        persistent=leaf not in parent._non_persistent_buffers_set,
-      )
-    elif b.device != device:
-      parent_path, _, leaf = name.rpartition(".")
-      parent = model.get_submodule(parent_path) if parent_path else model
-      parent.register_buffer(
-        leaf,
-        b.to(device=device),
-        persistent=leaf not in parent._non_persistent_buffers_set,
-      )
+  for name, buffer in list(model.named_buffers()):
+    parent_path, _, leaf = name.rpartition(".")
+    parent = model.get_submodule(parent_path) if parent_path else model
+    persistent = leaf not in parent._non_persistent_buffers_set
+    if persistent and buffer.is_floating_point():
+      moved = buffer.to(device=device, dtype=dtype)
+    else:
+      moved = buffer.to(device=device)
+    if moved is not buffer:
+      parent.register_buffer(leaf, moved, persistent=persistent)
 
 
 # ---------------------------------------------------------------------------
