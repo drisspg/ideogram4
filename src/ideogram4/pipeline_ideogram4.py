@@ -676,10 +676,9 @@ class Ideogram4Pipeline:
       device=self.device,
     )
 
+    schedule_values = schedule(step_intervals)
     for i in range(num_steps - 1, -1, -1):
-      t_val = float(schedule(step_intervals[i + 1].unsqueeze(0)).item())
-      s_val = float(schedule(step_intervals[i].unsqueeze(0)).item())
-      t = torch.full((batch_size,), t_val, dtype=torch.float32, device=self.device)
+      t = schedule_values[i + 1].expand(batch_size)
 
       pos_z = torch.cat([text_z_padding, z], dim=1)
       pos_out = self.conditional_transformer(
@@ -703,7 +702,7 @@ class Ideogram4Pipeline:
 
       gw_i = gw_per_step[i]
       v = gw_i * pos_v + (1.0 - gw_i) * neg_v
-      delta = s_val - t_val
+      delta = schedule_values[i] - schedule_values[i + 1]
       z = z + v * delta
 
     return self._decode(z, grid_h=grid_h, grid_w=grid_w)  # type: ignore[arg-type]
