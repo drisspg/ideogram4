@@ -325,11 +325,24 @@ def load_fp8_state_dict_as_bf16(
   model.to(device)
 
 
-class OutputPaddedLinear(nn.Module):
-  def __init__(self, linear: nn.Linear, padded_out_features: int) -> None:
+class AdaptiveOutputPaddedLinear(nn.Module):
+  def __init__(
+    self,
+    linear: nn.Linear,
+    padded_out_features: int,
+    padded_token_threshold: int,
+  ) -> None:
     super().__init__()
     self.out_features = linear.out_features
+    self.padded_token_threshold = padded_token_threshold
     self.linear = nn.Linear(
+      linear.in_features,
+      linear.out_features,
+      bias=linear.bias is not None,
+      device=linear.weight.device,
+      dtype=linear.weight.dtype,
+    )
+    self.padded_linear = nn.Linear(
       linear.in_features,
       padded_out_features,
       bias=linear.bias is not None,
@@ -337,14 +350,18 @@ class OutputPaddedLinear(nn.Module):
       dtype=linear.weight.dtype,
     )
     with torch.no_grad():
-      self.linear.weight.zero_()
-      self.linear.weight[: linear.out_features].copy_(linear.weight)
+      self.linear.weight.copy_(linear.weight)
+      self.padded_linear.weight.zero_()
+      self.padded_linear.weight[: linear.out_features].copy_(linear.weight)
       if linear.bias is not None:
-        self.linear.bias.zero_()
-        self.linear.bias[: linear.out_features].copy_(linear.bias)
+        self.linear.bias.copy_(linear.bias)
+        self.padded_linear.bias.zero_()
+        self.padded_linear.bias[: linear.out_features].copy_(linear.bias)
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
-    return self.linear(x)[..., : self.out_features]
+    if x.shape[-2] <= self.padded_token_threshold:
+      return self.padded_linear(x)[..., : self.out_features]
+    return self.linear(x)
 
 
 def _base_torchao_quantization(quantization: str) -> str:
@@ -370,7 +387,7 @@ def _pad_mxfp8_mlp_linears(module: nn.Module) -> int:
       continue
     parent_path, _, child_name = fqn.rpartition(".")
     parent = module.get_submodule(parent_path) if parent_path else module
-    setattr(parent, child_name, OutputPaddedLinear(child, 14336))
+    setattr(parent, child_name, AdaptiveOutputPaddedLinear(child, 14336, 6144))
     converted += 1
   return converted
 
