@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import warnings
 
 import bitsandbytes as bnb
@@ -23,6 +24,15 @@ FP8_SCALE_SUFFIX = ".weight_scale"
 # Marker written into the text encoder's config.json so the loader knows to take
 # the custom weight-only FP8 path instead of transformers' from_pretrained.
 FP8_TEXT_ENCODER_CONFIG_FLAG = "ideogram_fp8_weight_only"
+_TORCHAO_BLOCK_SIZES = {
+  "nvfp4": 16,
+  "mxfp8": 32,
+  "mxfp8_floor": 32,
+  "mxfp8_even": 32,
+  "mxfp8_ceil": 32,
+  "fp8": None,
+  "fp8_row": None,
+}
 
 
 def is_bnb4bit_state_dict(state_dict: dict[str, torch.Tensor]) -> bool:
@@ -153,6 +163,28 @@ def is_fp8_state_dict(state_dict: dict[str, torch.Tensor]) -> bool:
   )
 
 
+def dequantize_fp8_state_dict(
+  state_dict: dict[str, torch.Tensor],
+  device: torch.device,
+  dtype: torch.dtype,
+) -> dict[str, torch.Tensor]:
+  """Materialize a weight-only FP8 checkpoint as regular floating tensors."""
+  prepared: dict[str, torch.Tensor] = {}
+  for key, tensor in state_dict.items():
+    if key.endswith(FP8_SCALE_SUFFIX):
+      continue
+    scale = state_dict.get(f"{key}_scale")
+    if tensor.dtype == FP8_WEIGHT_DTYPE and scale is not None:
+      prepared[key] = tensor.to(device=device, dtype=dtype) * scale.to(
+        device=device, dtype=dtype
+      ).unsqueeze(1)
+    elif tensor.is_floating_point():
+      prepared[key] = tensor.to(device=device, dtype=dtype)
+    else:
+      prepared[key] = tensor.to(device=device)
+  return prepared
+
+
 class Fp8Linear(nn.Module):
   """Linear layer holding an e4m3 float8 weight + per-row float32 scale.
 
@@ -268,3 +300,153 @@ def load_fp8_state_dict(
     warnings.warn(f"missing keys after fp8 load: {missing[:10]}", stacklevel=2)
 
   model.to(device)
+
+
+def load_fp8_state_dict_as_bf16(
+  model: nn.Module,
+  state_dict: dict[str, torch.Tensor],
+  device: torch.device,
+  dtype: torch.dtype,
+  *,
+  assign: bool = True,
+  strict: bool = True,
+) -> None:
+  """Load a weight-only FP8 checkpoint into ordinary Linear modules."""
+  missing, unexpected = model.load_state_dict(
+    dequantize_fp8_state_dict(state_dict, device, dtype), strict=False, assign=assign
+  )
+  if unexpected:
+    raise RuntimeError(f"unexpected keys after fp8 dequant load: {unexpected[:10]}")
+  if missing:
+    if strict:
+      raise RuntimeError(f"missing keys after fp8 dequant load: {missing[:10]}")
+    warnings.warn(f"missing keys after fp8 dequant load: {missing[:10]}", stacklevel=2)
+  model.to(device)
+
+
+def _base_torchao_quantization(quantization: str) -> str:
+  for suffix in ("_mlp_up", "_mlp_down", "_mlp"):
+    if quantization.endswith(suffix):
+      return quantization.removesuffix(suffix)
+  return quantization
+
+
+def _torchao_linear_filter(
+  module: nn.Module, fqn: str, block_size: int | None, quantization: str
+) -> bool:
+  if not isinstance(module, nn.Linear):
+    return False
+  if quantization.endswith("_mlp") and ".feed_forward." not in fqn:
+    return False
+  if quantization.endswith("_mlp_up") and not (
+    ".feed_forward.w1" in fqn or ".feed_forward.w3" in fqn
+  ):
+    return False
+  if quantization.endswith("_mlp_down") and ".feed_forward.w2" not in fqn:
+    return False
+  if any(filtered in fqn for filtered in ("embedder", "embed", "embedding")):
+    return False
+  out_features, in_features = module.weight.shape
+  if block_size is not None and in_features % block_size != 0:
+    return False
+  if block_size == 16 and out_features % 16 != 0:
+    return False
+  if out_features <= 64:
+    return False
+  return not (in_features <= 1024 and out_features <= 1024)
+
+
+def _torchao_nvfp4_config(use_triton_kernel: bool):
+  if use_triton_kernel:
+    os.environ.setdefault("TRITON_ALLOW_NON_CONSTEXPR_GLOBALS", "1")
+  try:
+    from torchao.prototype.mx_formats.inference_workflow import (  # type: ignore[import-not-found]
+      NVFP4DynamicActivationNVFP4WeightConfig,
+    )
+  except ImportError:
+    from torchao.prototype.mx_formats.mx_subclass import (  # type: ignore[import-not-found,no-redef]
+      NVFP4InferenceConfig as NVFP4DynamicActivationNVFP4WeightConfig,
+    )
+  return NVFP4DynamicActivationNVFP4WeightConfig(
+    use_triton_kernel=use_triton_kernel,
+    use_dynamic_per_tensor_scale=True,
+  )
+
+
+def _torchao_config(quantization: str, use_triton_kernel: bool):
+  base_quantization = _base_torchao_quantization(quantization)
+  match base_quantization:
+    case "nvfp4":
+      return _torchao_nvfp4_config(use_triton_kernel)
+    case "mxfp8" | "mxfp8_floor" | "mxfp8_even" | "mxfp8_ceil":
+      from torchao.prototype.mx_formats import (  # type: ignore[import-not-found]
+        MXDynamicActivationMXWeightConfig,
+      )
+      from torchao.prototype.mx_formats.mx_tensor import (  # type: ignore[import-not-found]
+        ScaleCalculationMode,
+      )
+
+      scaling_modes = {
+        "mxfp8": ScaleCalculationMode.RCEIL,
+        "mxfp8_floor": ScaleCalculationMode.FLOOR,
+        "mxfp8_even": ScaleCalculationMode.EVEN,
+        "mxfp8_ceil": ScaleCalculationMode.CEIL,
+      }
+      return MXDynamicActivationMXWeightConfig(
+        block_size=32,
+        activation_dtype=torch.float8_e4m3fn,
+        weight_dtype=torch.float8_e4m3fn,
+        scaling_mode=scaling_modes[base_quantization],
+      )
+    case "fp8":
+      from torchao.quantization import (  # type: ignore[import-not-found]
+        Float8DynamicActivationFloat8WeightConfig,
+        PerTensor,
+      )
+
+      return Float8DynamicActivationFloat8WeightConfig(granularity=PerTensor())
+    case "fp8_row":
+      from torchao.quantization import (  # type: ignore[import-not-found]
+        Float8DynamicActivationFloat8WeightConfig,
+        PerRow,
+      )
+      from torchao.quantization.quantize_.common.kernel_preference import (  # type: ignore[import-not-found]
+        KernelPreference,
+      )
+
+      return Float8DynamicActivationFloat8WeightConfig(
+        granularity=PerRow(), kernel_preference=KernelPreference.TORCH
+      )
+    case _:
+      raise ValueError(f"unsupported torchao quantization: {quantization}")
+
+
+def apply_torchao_quantization(
+  module: nn.Module,
+  quantization: str,
+  *,
+  use_triton_kernel: bool = True,
+) -> int:
+  """Apply optional torchao Linear quantization and return converted layer count."""
+  base_quantization = _base_torchao_quantization(quantization)
+  if base_quantization not in _TORCHAO_BLOCK_SIZES:
+    raise ValueError(f"unsupported torchao quantization: {quantization}")
+  block_size = _TORCHAO_BLOCK_SIZES[base_quantization]
+  try:
+    from torchao.quantization import quantize_  # type: ignore[import-not-found]
+  except ImportError as error:
+    raise RuntimeError(
+      f"torchao {quantization} requested but torchao is not installed in this environment"
+    ) from error
+
+  def filter_fn(child: nn.Module, fqn: str) -> bool:
+    return _torchao_linear_filter(child, fqn, block_size, quantization)
+
+  converted = sum(1 for fqn, child in module.named_modules() if filter_fn(child, fqn))
+  if converted == 0:
+    raise RuntimeError(
+      f"torchao {quantization} found no eligible nn.Linear layers; BNB NF4 and "
+      "custom FP8 Linear modules must be materialized back to ordinary Linear weights first"
+    )
+  quantize_(module, config=_torchao_config(quantization, use_triton_kernel), filter_fn=filter_fn)
+  return converted

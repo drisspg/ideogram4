@@ -65,6 +65,37 @@ def main() -> None:
   parser.add_argument("--seed", type=int, default=0)
   parser.add_argument("--device", default=_default_device())
   parser.add_argument(
+    "--compile-model",
+    action="store_true",
+    help="Compile repeated inference modules with torch.compile; first generation pays compilation cost.",
+  )
+  parser.add_argument(
+    "--torchao-linear",
+    choices=(
+      "bf16",
+      "fp8",
+      "fp8_row",
+      "fp8_row_mlp",
+      "mxfp8",
+      "mxfp8_floor",
+      "mxfp8_even",
+      "mxfp8_ceil",
+      "mxfp8_mlp",
+      "nvfp4",
+      "nvfp4_mlp",
+      "nvfp4_mlp_up",
+      "nvfp4_mlp_down",
+    ),
+    help=(
+      "Materialize fp8 weights to regular Linear modules, then optionally "
+      "convert them to a torchao/PyTorch scaled_mm Linear engine. Use bf16 for "
+      "a materialized full-bf16 baseline, fp8 for per-tensor FP8, fp8_row for "
+      "per-row FP8, fp8_row_mlp for per-row FP8 transformer MLPs only, mxfp8 "
+      "for MXFP8 block-32, or nvfp4 for NVFP4 block-16. "
+      "Requires --quantization fp8."
+    ),
+  )
+  parser.add_argument(
     "--quantization",
     choices=sorted(QUANTIZATION_REPOS.keys()),
     default=_default_quantization(),
@@ -142,6 +173,15 @@ def main() -> None:
   )
   args = parser.parse_args()
 
+  if args.torchao_linear and args.quantization == "nf4":
+    print(
+      "ERROR: --torchao-linear cannot consume the bnb NF4 checkpoint directly. "
+      "Use --quantization fp8 to materialize regular weights before converting "
+      "to a PyTorch scaled_mm low-precision engine.",
+      file=sys.stderr,
+    )
+    sys.exit(2)
+
   if args.hive_text_key:
     flags = moderate_prompt(args.prompt, args.hive_text_key)
     if flags:
@@ -179,7 +219,11 @@ def main() -> None:
   preset = PRESETS[args.sampler_preset]
 
   pipe = Ideogram4Pipeline.from_pretrained(
-    config=Ideogram4PipelineConfig(weights_repo=QUANTIZATION_REPOS[args.quantization]),
+    config=Ideogram4PipelineConfig(
+      weights_repo=QUANTIZATION_REPOS[args.quantization],
+      compile_model=args.compile_model,
+      torchao_quantization=args.torchao_linear,
+    ),
     device=args.device,
     dtype=torch.bfloat16,
   )

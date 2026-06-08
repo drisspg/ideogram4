@@ -31,10 +31,12 @@ from ideogram4.latent_norm import get_latent_norm
 from ideogram4.modeling_ideogram4 import Ideogram4Config, Ideogram4Transformer
 from ideogram4.quantized_loading import (
   FP8_TEXT_ENCODER_CONFIG_FLAG,
+  apply_torchao_quantization,
   is_bnb4bit_state_dict,
   is_fp8_state_dict,
   load_bnb4bit_state_dict,
   load_fp8_state_dict,
+  load_fp8_state_dict_as_bf16,
   swap_linears_to_bnb4bit,
   swap_linears_to_fp8,
 )
@@ -137,13 +139,14 @@ def _load_fp8_text_encoder(
   dtype: torch.dtype,
   *,
   text_encoder_subfolder: str,
+  torchao_quantization: str | None = None,
 ):
   """Rebuild the text encoder from its config and load weight-only FP8 weights.
 
   transformers' ``from_pretrained`` can't read our float8 layout, so we
   instantiate the architecture with ``from_config`` (which also computes the
-  non-persistent buffers such as rotary caches), swap the quantized Linears, and
-  load the FP8 state dict with ``assign=True``.
+  non-persistent buffers such as rotary caches), then either keep FP8 Linears or
+  materialize ordinary Linear weights before optional torchao quantization.
   """
   config = AutoConfig.from_pretrained(
     repo_id, subfolder=text_encoder_subfolder, trust_remote_code=True
@@ -152,14 +155,21 @@ def _load_fp8_text_encoder(
   with torch.device("meta"):
     model = AutoModel.from_config(config, trust_remote_code=True)
   _materialize_qwen3_vl_meta_init_buffers(model)
-  with torch.device("meta"):
-    swap_linears_to_fp8(model, state_dict, compute_dtype=dtype)
-  # assign=True so unquantized params take the loaded dtype and the computed
-  # rotary buffers (absent from the checkpoint) survive; tied weights, if any,
-  # surface as benign missing keys.
-  load_fp8_state_dict(
-    model, state_dict, device=device, dtype=dtype, assign=True, strict=False
-  )
+  if torchao_quantization is not None:
+    load_fp8_state_dict_as_bf16(
+      model, state_dict, device=device, dtype=dtype, assign=True, strict=False
+    )
+    if torchao_quantization not in (None, "bf16"):
+      apply_torchao_quantization(model, torchao_quantization)
+  else:
+    with torch.device("meta"):
+      swap_linears_to_fp8(model, state_dict, compute_dtype=dtype)
+    # assign=True so unquantized params take the loaded dtype and the computed
+    # rotary buffers (absent from the checkpoint) survive; tied weights, if any,
+    # surface as benign missing keys.
+    load_fp8_state_dict(
+      model, state_dict, device=device, dtype=dtype, assign=True, strict=False
+    )
   model.eval()
   return model
 
@@ -171,6 +181,7 @@ def _load_qwen3_vl(
   *,
   tokenizer_subfolder: str | None = None,
   text_encoder_subfolder: str | None = None,
+  torchao_quantization: str | None = None,
 ):
   """Load the Qwen3-VL tokenizer + model, optionally from named subfolders of ``repo_id``.
 
@@ -200,8 +211,13 @@ def _load_qwen3_vl(
       device,
       dtype,
       text_encoder_subfolder=text_encoder_subfolder or "",
+      torchao_quantization=torchao_quantization,
     )
   elif bnb4bit_config is not None:
+    if torchao_quantization is not None:
+      raise ValueError(
+        f"torchao {torchao_quantization} cannot be applied directly to bnb 4-bit text encoder weights"
+      )
     model = _load_bnb4bit_text_encoder(
       repo_id,
       device,
@@ -247,8 +263,14 @@ def _build_transformer(
   state_dict: dict[str, torch.Tensor],
   device: torch.device,
   dtype: torch.dtype,
+  *,
+  torchao_quantization: str | None = None,
 ) -> "Ideogram4Transformer":
   if is_bnb4bit_state_dict(state_dict):
+    if torchao_quantization is not None:
+      raise ValueError(
+        f"torchao {torchao_quantization} cannot be applied directly to bnb 4-bit transformer weights"
+      )
     if device.type != "cuda":
       raise ValueError(f"bnb 4-bit weights require a CUDA device, got device={device}")
     model = build_meta_transformer(transformer_config)
@@ -257,13 +279,20 @@ def _build_transformer(
     load_bnb4bit_state_dict(model, state_dict, device=device, dtype=dtype)
   elif is_fp8_state_dict(state_dict):
     model = build_meta_transformer(transformer_config)
-    with torch.device("meta"):
-      swap_linears_to_fp8(model, state_dict, compute_dtype=dtype)
-    load_fp8_state_dict(model, state_dict, device=device, dtype=dtype, assign=True)
+    if torchao_quantization is not None:
+      load_fp8_state_dict_as_bf16(model, state_dict, device=device, dtype=dtype)
+      if torchao_quantization not in (None, "bf16"):
+        apply_torchao_quantization(model, torchao_quantization)
+    else:
+      with torch.device("meta"):
+        swap_linears_to_fp8(model, state_dict, compute_dtype=dtype)
+      load_fp8_state_dict(model, state_dict, device=device, dtype=dtype, assign=True)
   else:
     model = Ideogram4Transformer(transformer_config)
     model.load_state_dict(state_dict)
     model.to(device=device, dtype=dtype)
+    if torchao_quantization not in (None, "bf16"):
+      apply_torchao_quantization(model, torchao_quantization)
   model.eval()
   return model
 
@@ -336,6 +365,10 @@ class Ideogram4PipelineConfig:
   patch_size: int = 2
   ae_scale_factor: int = 8
   max_text_tokens: int = 2048
+  compile_model: bool = False
+  compile_mode: str = "default"
+  torchao_quantization: str | None = None
+  torchao_quantize_text_encoder: bool = False
 
 
 class Ideogram4Pipeline:
@@ -390,11 +423,19 @@ class Ideogram4Pipeline:
     )
 
     conditional_transformer = _build_transformer(
-      transformer_config, conditional_state_dict, device, dtype
+      transformer_config,
+      conditional_state_dict,
+      device,
+      dtype,
+      torchao_quantization=config.torchao_quantization,
     )
     del conditional_state_dict
     unconditional_transformer = _build_transformer(
-      transformer_config, unconditional_state_dict, device, dtype
+      transformer_config,
+      unconditional_state_dict,
+      device,
+      dtype,
+      torchao_quantization=config.torchao_quantization,
     )
     del unconditional_state_dict
 
@@ -404,10 +445,13 @@ class Ideogram4Pipeline:
       dtype,
       tokenizer_subfolder=config.tokenizer_subfolder,
       text_encoder_subfolder=config.text_encoder_subfolder,
+      torchao_quantization=config.torchao_quantization
+      if config.torchao_quantize_text_encoder
+      else None,
     )
     autoencoder = _load_autoencoder(autoencoder_weights, device, dtype)
 
-    return cls(
+    pipeline = cls(
       conditional_transformer=conditional_transformer,
       unconditional_transformer=unconditional_transformer,
       text_encoder=text_encoder,
@@ -417,6 +461,19 @@ class Ideogram4Pipeline:
       device=device,
       dtype=dtype,
     )
+    if config.compile_model:
+      pipeline.compile_inference_modules(mode=config.compile_mode)
+    return pipeline
+
+  def compile_inference_modules(self, *, mode: str | None = "default") -> None:
+    """Compile repeated inference modules; first generation pays compilation cost."""
+    self.conditional_transformer = torch.compile(
+      self.conditional_transformer, mode=mode, dynamic=False
+    )
+    self.unconditional_transformer = torch.compile(
+      self.unconditional_transformer, mode=mode, dynamic=False
+    )
+    self.autoencoder = torch.compile(self.autoencoder, mode=mode, dynamic=False)
 
   def _tokenize(self, prompt: str) -> tuple[torch.Tensor, int]:
     """Build chat-formatted token ids for a single prompt."""
