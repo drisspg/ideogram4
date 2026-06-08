@@ -81,6 +81,7 @@ def main() -> None:
       "mxfp8_even",
       "mxfp8_ceil",
       "mxfp8_mlp",
+      "mxfp8_mlp_padded",
       "nvfp4",
       "nvfp4_mlp",
       "nvfp4_mlp_up",
@@ -91,7 +92,8 @@ def main() -> None:
       "convert them to a torchao/PyTorch scaled_mm Linear engine. Use bf16 for "
       "a materialized full-bf16 baseline, fp8 for per-tensor FP8, fp8_row for "
       "per-row FP8, fp8_row_mlp for per-row FP8 transformer MLPs only, mxfp8 "
-      "for MXFP8 block-32, or nvfp4 for NVFP4 block-16. "
+      "for MXFP8 block-32, mxfp8_mlp_padded for padded MXFP8 MLP up/gate "
+      "projections, or nvfp4 for NVFP4 block-16. "
       "Requires --quantization fp8."
     ),
   )

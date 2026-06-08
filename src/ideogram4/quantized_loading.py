@@ -30,6 +30,7 @@ _TORCHAO_BLOCK_SIZES = {
   "mxfp8_floor": 32,
   "mxfp8_even": 32,
   "mxfp8_ceil": 32,
+  "mxfp8_mlp_padded": 32,
   "fp8": None,
   "fp8_row": None,
 }
@@ -324,17 +325,62 @@ def load_fp8_state_dict_as_bf16(
   model.to(device)
 
 
+class OutputPaddedLinear(nn.Module):
+  def __init__(self, linear: nn.Linear, padded_out_features: int) -> None:
+    super().__init__()
+    self.out_features = linear.out_features
+    self.linear = nn.Linear(
+      linear.in_features,
+      padded_out_features,
+      bias=linear.bias is not None,
+      device=linear.weight.device,
+      dtype=linear.weight.dtype,
+    )
+    with torch.no_grad():
+      self.linear.weight.zero_()
+      self.linear.weight[: linear.out_features].copy_(linear.weight)
+      if linear.bias is not None:
+        self.linear.bias.zero_()
+        self.linear.bias[: linear.out_features].copy_(linear.bias)
+
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+    return self.linear(x)[..., : self.out_features]
+
+
 def _base_torchao_quantization(quantization: str) -> str:
+  if quantization == "mxfp8_mlp_padded":
+    return "mxfp8"
   for suffix in ("_mlp_up", "_mlp_down", "_mlp"):
     if quantization.endswith(suffix):
       return quantization.removesuffix(suffix)
   return quantization
 
 
+def _is_mlp_padded_target(fqn: str, module: nn.Linear) -> bool:
+  return (
+    (".feed_forward.w1" in fqn or ".feed_forward.w3" in fqn)
+    and module.out_features == 12288
+  )
+
+
+def _pad_mxfp8_mlp_linears(module: nn.Module) -> int:
+  converted = 0
+  for fqn, child in list(module.named_modules()):
+    if not isinstance(child, nn.Linear) or not _is_mlp_padded_target(fqn, child):
+      continue
+    parent_path, _, child_name = fqn.rpartition(".")
+    parent = module.get_submodule(parent_path) if parent_path else module
+    setattr(parent, child_name, OutputPaddedLinear(child, 14336))
+    converted += 1
+  return converted
+
+
 def _torchao_linear_filter(
   module: nn.Module, fqn: str, block_size: int | None, quantization: str
 ) -> bool:
   if not isinstance(module, nn.Linear):
+    return False
+  if quantization in ("mxfp8_mlp_padded",) and ".feed_forward." not in fqn:
     return False
   if quantization.endswith("_mlp") and ".feed_forward." not in fqn:
     return False
@@ -428,6 +474,8 @@ def apply_torchao_quantization(
   use_triton_kernel: bool = True,
 ) -> int:
   """Apply optional torchao Linear quantization and return converted layer count."""
+  if quantization == "mxfp8_mlp_padded":
+    _pad_mxfp8_mlp_linears(module)
   base_quantization = _base_torchao_quantization(quantization)
   if base_quantization not in _TORCHAO_BLOCK_SIZES:
     raise ValueError(f"unsupported torchao quantization: {quantization}")
